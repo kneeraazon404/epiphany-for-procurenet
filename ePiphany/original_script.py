@@ -1,24 +1,25 @@
 # 1. Import the necessary libraries
-import openai
-import psycopg2
-import logging
-from woocommerce import API
 import asyncio
-import aiohttp
-import sys
+import codecs
+import itertools
+import json
+import logging
 import os
-from functools import partial
-from aiohttp import ClientSession, client_exceptions
+import sys
 import time
 import traceback
-import itertools
-from halo import Halo
-import json
-from concurrent.futures import ThreadPoolExecutor
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from html import unescape
+
+import aiohttp
+import openai
+import psycopg2
 import simplejson as json
-import codecs
+from aiohttp import ClientSession, client_exceptions
+from halo import Halo
+from woocommerce import API
 
 # Spinner setup
 success_message = "Loading success"
@@ -115,6 +116,7 @@ logger.info(
 # 6. Implement the async functions and logic for product updates, WooCommerce API operations, and error handling
 semaphore = asyncio.Semaphore(25)
 
+
 def call_chat_completions(model, messages):
     response = openai.ChatCompletion.create(
         model=model,
@@ -123,15 +125,17 @@ def call_chat_completions(model, messages):
     print(f"Raw API Response: {response}")
     return response
 
+
 def extract_json_string(generated_text):
     # Find the start and end of the JSON object
     start = generated_text.find("{")
     end = generated_text.rfind("}")
-    
+
     # Extract the JSON object
-    json_string = generated_text[start:end+1]
+    json_string = generated_text[start : end + 1]
 
     return json_string
+
 
 def sanitize_json_string(json_string):
     try:
@@ -139,19 +143,24 @@ def sanitize_json_string(json_string):
         data = json.loads(json_string)
     except json.JSONDecodeError:
         # If there's an error, remove control characters and unwanted backslashes from the string and try again.
-        sanitized_string = remove_control_characters_and_unwanted_backslashes(json_string)
+        sanitized_string = remove_control_characters_and_unwanted_backslashes(
+            json_string
+        )
         data = json.loads(sanitized_string)
-    
+
     return data
 
+
 def remove_control_characters_and_unwanted_backslashes(s):
-    sanitized_string = "".join(ch for ch in s if unicodedata.category(ch)[0]!="C")
-    sanitized_string = codecs.decode(sanitized_string.encode().decode('unicode_escape'))
+    sanitized_string = "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
+    sanitized_string = codecs.decode(sanitized_string.encode().decode("unicode_escape"))
 
     return sanitized_string
 
+
 def remove_control_characters(s):
-    return "".join(ch for ch in s if unicodedata.category(ch)[0]!="C")
+    return "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
+
 
 async def request_with_retry(url, retries=3, backoff_factor=0.3):
     for retry in range(retries):
@@ -167,9 +176,10 @@ async def request_with_retry(url, retries=3, backoff_factor=0.3):
                 break
             except client_exceptions.ServerDisconnectedError:
                 if retry < retries - 1:  # if not the last retry
-                    await asyncio.sleep(backoff_factor * (2 ** retry))
+                    await asyncio.sleep(backoff_factor * (2**retry))
                 else:
                     raise
+
 
 async def generate_description(prompt, product_title, description_type):
     assistant_messages = [
@@ -184,9 +194,9 @@ async def generate_description(prompt, product_title, description_type):
         try:
             with ThreadPoolExecutor() as executor:
                 response = await loop.run_in_executor(
-                    executor, 
-                    call_chat_completions, 
-                    "gpt-4",  
+                    executor,
+                    call_chat_completions,
+                    "gpt-4",
                     assistant_messages,
                 )
             if response and response.get("choices") and len(response["choices"]) > 0:
@@ -202,7 +212,8 @@ async def generate_description(prompt, product_title, description_type):
         except Exception as error:
             logger.error(f"Error during OpenAI API call: {error}")
             return None
-                
+
+
 async def get_category_data(session, wcapi, category_id):
     async with semaphore, session.get(
         f"{wcapi.url}/wp-json/wc/v3/products/categories/{category_id}",
@@ -213,6 +224,7 @@ async def get_category_data(session, wcapi, category_id):
         category_name = category_data.get("name")
         product_count = category_data.get("count")
         return category_name, product_count
+
 
 async def retry_failed_products():
     query = "SELECT id, product_name, product_url, short_description, description FROM failed_products"
@@ -247,6 +259,7 @@ async def is_product_updated(product_id):
     c.execute(query, (product_id,))
     return c.fetchone()[0]
 
+
 async def update_product_descriptions_locally(
     session, wcapi, product, index, total, start_time, elapsed_time
 ):
@@ -279,7 +292,7 @@ async def update_product_descriptions_locally(
             "Craft a compelling 150-word short description in HTML for product '{product_title}'. Employ bullet points when presenting crucial details, "
             "apply bold formatting to emphasize keywords in each bullet point, and omit any nonessential supplier specifics or irrelevant product data. "
             "IMPORTANT: If specific data for an attribute like CAS number or chemical formula isn't known, SKIP that attribute entirely. Do not use placeholders like 'Not available' or 'still being determined'. "
-            "Please return ONLY a JSON object with the following key: \"short_description\". No additional text or formatting is needed."
+            'Please return ONLY a JSON object with the following key: "short_description". No additional text or formatting is needed.'
         ).format(short_description=short_description, product_title=product_title)
 
         # Modify long description prompt
@@ -291,17 +304,13 @@ async def update_product_descriptions_locally(
             "Rotatable Bond Count, Hazard and Precautionary Statements, GHS Classification, LD50, Routes of Exposure, Carcinogenicity, "
             "Teratogenicity, Bioassay Results, Target Proteins, Mechanism of Action, Pharmacological Class, ADME data, NMR, MS, IR, UV-Vis, "
             "Environmental Fate, Biodegradability, Ecotoxicity, Therapeutic Uses, Dosage, Contraindications, Side Effects, Drug Interactions.\n\n"
-            
             "For other products in the marketplace, use your general product knowledge data up to September 2021 to help enhance and expand the listing. "
             "Start by utilizing the initial description provided: '{long_description}'. After gathering the details, craft a compelling 1000-word "
             "detail product description in HTML highlighting the product's key features for '{product_title}'. Use bullet points for vital information "
             "and exclude any unrelated supplier specifics or non-pertinent product data.\n\n"
-            
             "IMPORTANT: If specific data for an attribute isn't known, SKIP that attribute entirely. Do not use placeholders like 'Not available'.\n\n"
-            
             "Also, generate an SEO-friendly title for this product, a meta description that is under 155 characters, two focus keywords based on the meta description, and a list of relevant product tags.\n\n"
-            
-            "Please return ONLY a JSON object with the following keys: \"long_description\", \"seo_title\", \"meta_description\", \"focus_keywords\", \"tags\". No additional text or formatting is needed."
+            'Please return ONLY a JSON object with the following keys: "long_description", "seo_title", "meta_description", "focus_keywords", "tags". No additional text or formatting is needed.'
         ).format(long_description=long_description, product_title=product_title)
 
         result_data_short = await generate_description(
@@ -311,7 +320,9 @@ async def update_product_descriptions_locally(
         if result_data_short is not None:
             short_description = result_data_short["short_description"]
         else:
-            logger.error(f"No short description generated for product '{product_title}'. Skipping update.")
+            logger.error(
+                f"No short description generated for product '{product_title}'. Skipping update."
+            )
             return
 
         result_data_long = await generate_description(
@@ -325,7 +336,9 @@ async def update_product_descriptions_locally(
             focus_keywords_long = result_data_long["focus_keywords"]
             tags_long = result_data_long["tags"]
         else:
-            logger.error(f"No long description generated for product '{product_title}'. Skipping update.")
+            logger.error(
+                f"No long description generated for product '{product_title}'. Skipping update."
+            )
             return
 
         # Call the update_product_on_woocommerce with the appropriate arguments:
@@ -356,7 +369,9 @@ async def update_product_descriptions_locally(
             )
             await save_updated_product(product_id, product_title, final_product_url)
         else:
-            logger.error(f"Error when updating product: The product update operation was not successful.")
+            logger.error(
+                f"Error when updating product: The product update operation was not successful."
+            )
             await save_failed_product(
                 product_id,
                 product_title,
@@ -365,7 +380,9 @@ async def update_product_descriptions_locally(
                 long_description,
             )
     except Exception as e:
-        logger.error(f"Error updating product {product['id']} - {product.get('name')}: {str(e)}")
+        logger.error(
+            f"Error updating product {product['id']} - {product.get('name')}: {str(e)}"
+        )
         await save_failed_product(
             product["id"],
             product.get("name"),
@@ -458,7 +475,10 @@ async def update_product_on_woocommerce(
                     "meta_data": [  # Add the meta data for Yoast SEO
                         {"key": "_yoast_wpseo_metadesc", "value": seo_meta_description},
                         {"key": "_yoast_wpseo_title", "value": seo_title},
-                        {"key": "_yoast_wpseo_focuskw", "value": focus_keywords},  # Add focus keywords
+                        {
+                            "key": "_yoast_wpseo_focuskw",
+                            "value": focus_keywords,
+                        },  # Add focus keywords
                     ],
                 },
                 ssl=False,
@@ -476,7 +496,9 @@ async def update_product_on_woocommerce(
 
         except aiohttp.client_exceptions.ServerDisconnectedError:
             if i < retries - 1:
-                await asyncio.sleep(backoff_factor * (2 ** i))  # Backoff before retrying
+                await asyncio.sleep(
+                    backoff_factor * (2**i)
+                )  # Backoff before retrying
                 continue
             else:
                 logger.error(f"Server disconnected after {i + 1} attempts.")
@@ -528,6 +550,7 @@ async def save_updated_product(product_id, product_name, product_url):
     except psycopg2.Error as e:
         logger.error(f"Database error: {str(e)}")
         conn.rollback()
+
 
 async def view_recent_updates():
     query = "SELECT id, product_name, product_url, last_update FROM updated_products ORDER BY last_update DESC"
@@ -583,6 +606,7 @@ async def get_products_in_category(session, wcapi, category_id, page, per_page=2
 
     return products
 
+
 async def get_seconds_elapsed():
     query = "SELECT EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_update)) FROM updated_products"
     c.execute(query)
@@ -633,6 +657,7 @@ async def update_one_product():
     elapsed_time = time.time() - start_time
     print(f"Total time for updating product '{product_id}': {elapsed_time:.2f} seconds")
 
+
 async def update_category_products():
     category_id = input("Enter the ID of the category to update: ")
     category_name, product_count = await get_category_data(session, wcapi, category_id)
@@ -659,10 +684,18 @@ async def update_category_products():
     async def handle_update(product, index):
         try:
             await update_product_descriptions_locally(
-                session, wcapi, product, index + 1, total_products, start_time, elapsed_time
+                session,
+                wcapi,
+                product,
+                index + 1,
+                total_products,
+                start_time,
+                elapsed_time,
             )
         except Exception as e:
-            logger.error(f"Error updating product {product['id']} - {product.get('name')}: {str(e)}")
+            logger.error(
+                f"Error updating product {product['id']} - {product.get('name')}: {str(e)}"
+            )
             await save_failed_product(
                 product["id"],
                 product.get("name"),
@@ -730,13 +763,17 @@ async def resume_previous_update():
             session, wcapi, product, 1, 1, start_time, 0
         )
 
+
 async def view_failed_products():
     query = "SELECT id, product_name, product_url FROM failed_products"
     c.execute(query)
     failed_products = c.fetchall()
     print("Failed products:")
     for product in failed_products:
-        print(f"Product ID: {product[0]}, Product Name: {product[1]}, Product URL: {product[2]}")
+        print(
+            f"Product ID: {product[0]}, Product Name: {product[1]}, Product URL: {product[2]}"
+        )
+
 
 async def get_updated_product_ids():
     query = "SELECT id FROM updated_products"
