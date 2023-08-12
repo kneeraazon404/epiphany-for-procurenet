@@ -1,101 +1,30 @@
 import asyncio
-import codecs
-import json
 import time
-import unicodedata
 from html import unescape
 
 import aiohttp
-import openai
 import psycopg2
-from aiohttp import ClientSession, client_exceptions
+from aiohttp import ClientSession
 
 from config import semaphore, session, wcapi
 from database import c, conn
 from logger_setup import logger
 
 
-# 3. Set up API keys and other constants
-def call_chat_completions(model, messages):
-    response = openai.ChatCompletion.create(
-        model=model,
-        messages=messages,
-    )
-    print(f"Raw API Response: {response}")
-    return response
-
-
-async def get_category_data(session, wcapi, category_id):
-    async with semaphore, session.get(
-        f"{wcapi.url}/wp-json/wc/v3/products/categories/{category_id}",
-        auth=aiohttp.BasicAuth(wcapi.consumer_key, wcapi.consumer_secret),
-        ssl=False,
-    ) as resp:
-        category_data = await resp.json()
-        category_name = category_data.get("name")
-        product_count = category_data.get("count")
-        return category_name, product_count
-
-
-async def is_product_updated(product_id):
-    query = "SELECT EXISTS(SELECT 1 FROM updated_products WHERE id = %s)"
-    c.execute(query, (product_id,))
-    return c.fetchone()[0]
-
-
-def extract_json_string(generated_text):
-    # Find the start and end of the JSON object
-    start = generated_text.find("{")
-    end = generated_text.rfind("}")
-
-    # Extract the JSON object
-    json_string = generated_text[start : end + 1]
-
-    return json_string
-
-
-def sanitize_json_string(json_string):
-    try:
-        # Try to load the JSON string. If it's valid JSON and there are no control characters, this will succeed.
-        data = json.loads(json_string)
-    except json.JSONDecodeError:
-        # If there's an error, remove control characters and unwanted backslashes from the string and try again.
-        sanitized_string = remove_control_characters_and_unwanted_backslashes(
-            json_string
-        )
-        data = json.loads(sanitized_string)
-
-    return data
-
-
-def remove_control_characters_and_unwanted_backslashes(s):
-    sanitized_string = "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
-    sanitized_string = codecs.decode(sanitized_string.encode().decode("unicode_escape"))
-
-    return sanitized_string
-
-
-def remove_control_characters(s):
-    return "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
-
-
-async def request_with_retry(url, retries=3, backoff_factor=0.3):
+async def request_with_retry(url, semaphore, retries=3, backoff_factor=0.3):
     for retry in range(retries):
         async with semaphore:  # Acquire the semaphore
             try:
                 async with ClientSession() as session:
-                    # Your request logic here
-                    # For example:
                     response = await session.get(url)
                     response_data = await response.text()
                     return response_data
                 # If successful, break out of loop
-                break
-            except client_exceptions.ServerDisconnectedError:
+            except aiohttp.ClientError as e:
                 if retry < retries - 1:  # if not the last retry
                     await asyncio.sleep(backoff_factor * (2**retry))
                 else:
-                    raise
+                    raise e
 
 
 async def get_product_data(session, wcapi, product_id):
@@ -169,7 +98,11 @@ async def update_product_on_woocommerce(
                 },
                 ssl=False,
             ) as resp:
-                response_data = await resp.json()
+                # Check if the response is JSON before trying to parse
+                if "application/json" in resp.headers.get("Content-Type"):
+                    response_data = await resp.json()
+                else:
+                    raise Exception("Response is not in JSON format")
 
                 if resp.status == 200:
                     final_product_url = response_data.get("permalink")
@@ -198,8 +131,8 @@ async def update_product_on_woocommerce(
                 new_short_description,
                 new_long_description,
             )
-            return None, None
-
+            return None
+    # Return the response data at the end
     return response_data
 
 
@@ -291,6 +224,18 @@ async def get_products_in_category(session, wcapi, category_id, page, per_page=2
         products.extend(page_products)
 
     return products
+
+
+async def get_category_data(session, wcapi, category_id):
+    async with semaphore, session.get(
+        f"{wcapi.url}/wp-json/wc/v3/products/categories/{category_id}",
+        auth=aiohttp.BasicAuth(wcapi.consumer_key, wcapi.consumer_secret),
+        ssl=False,
+    ) as resp:
+        category_data = await resp.json()
+        category_name = category_data.get("name")
+        product_count = category_data.get("count")
+        return category_name, product_count
 
 
 async def get_seconds_elapsed():
@@ -505,6 +450,12 @@ from database import *
 from generate_description import generate_description
 from logger_setup import logger
 from utils import *
+
+
+async def is_product_updated(product_id):
+    query = "SELECT EXISTS(SELECT 1 FROM updated_products WHERE id = %s)"
+    c.execute(query, (product_id,))
+    return c.fetchone()[0]
 
 
 async def update_product_descriptions_locally(

@@ -38,7 +38,7 @@ except (KeyboardInterrupt, SystemExit):
 # 2. Use the spinner for the loading effect
 
 # API keys and other constants
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = "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"
 openai.api_key = OPENAI_API_KEY
 
 
