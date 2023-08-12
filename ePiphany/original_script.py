@@ -283,34 +283,34 @@ async def update_product_descriptions_locally(
                 logger.info(f"Skipping product '{product_id}' - {product_title}.")
                 return
             # Generate prompts for short and long description
-            short_desc_prompt = (
-                f"As a product analyst, your task is to update our product listings for a B2B marketplace that is tailored for bulk sales. "
-                f"Start with the base description: '{short_description}'. If the product has a chemical formula or CAS number, integrate "
-                f"pertinent details from your data up to September 2021. For other products in the marketplace, use your general product knowledge "
-                f"to enhance and expand the listing. Filter out irrelevant supplier data and unnecessary product specifics. "
-                f"Craft a compelling 150-word short description in HTML for product '{product_title}'. Employ bullet points when presenting crucial details, "
-                f"apply bold formatting to emphasize keywords in each bullet point, and omit any nonessential supplier specifics or irrelevant product data. "
-                f"IMPORTANT: If specific data for an attribute like CAS number or chemical formula isn't known, SKIP that attribute entirely. Do not use placeholders like 'Not available' or 'still being determined'. "
-                f'Please return ONLY a JSON object with the following key: "short_description". No additional text or formatting is needed.'
-            ).format(short_description=short_description, product_title=product_title)
+        short_desc_prompt = (
+            f"As a product analyst, your task is to update our product listings for a B2B marketplace that is tailored for bulk sales. "
+            f"Start with the base description: '{short_description}'. If the product has a chemical formula or CAS number, integrate "
+            f"pertinent details from your data up to September 2021. For other products in the marketplace, use your general product knowledge "
+            f"to enhance and expand the listing. Filter out irrelevant supplier data and unnecessary product specifics. "
+            f"Craft a compelling 150-word short description in HTML for product '{product_title}'. Employ bullet points when presenting crucial details, "
+            f"apply bold formatting to emphasize keywords in each bullet point, and omit any nonessential supplier specifics or irrelevant product data. "
+            f"IMPORTANT: If specific data for an attribute like CAS number or chemical formula isn't known, SKIP that attribute entirely. Do not use placeholders like 'Not available' or 'still being determined'. "
+            f'Please return ONLY a JSON object with the following key: "short_description". No additional text or formatting is needed.'
+        ).format(short_description=short_description, product_title=product_title)
 
-            # Modify long description prompt
-            long_desc_prompt = (
-                f"As a product analyst, your task is to update our product listings for our B2B marketplace that is tailored for bulk sales. "
-                f"For products that have CAS or a chemical formula, you can look for those attributes from the following list if available: "
-                f"Compound Name, Synonyms, IUPAC Name, CAS Number, Molecular Formula, Molecular Weight, Canonical SMILES, InChI strings, "
-                f"Boiling Point, Melting Point, Flash Point, Density, Solubility, Vapor Pressure, Refractive Index, pH, LogP, Polar Surface Area, "
-                f"Rotatable Bond Count, Hazard and Precautionary Statements, GHS Classification, LD50, Routes of Exposure, Carcinogenicity, "
-                f"Teratogenicity, Bioassay Results, Target Proteins, Mechanism of Action, Pharmacological Class, ADME data, NMR, MS, IR, UV-Vis, "
-                f"Environmental Fate, Biodegradability, Ecotoxicity, Therapeutic Uses, Dosage, Contraindications, Side Effects, Drug Interactions.\n\n"
-                f"For other products in the marketplace, use your general product knowledge data up to September 2021 to help enhance and expand the listing. "
-                f"Start by utilizing the initial description provided: '{long_description}'. After gathering the details, craft a compelling 1000-word "
-                f"detail product description in HTML highlighting the product's key features for '{product_title}'. Use bullet points for vital information "
-                f"and exclude any unrelated supplier specifics or non-pertinent product data.\n\n"
-                f"IMPORTANT: If specific data for an attribute isn't known, SKIP that attribute entirely. Do not use placeholders like 'Not available'.\n\n"
-                f"Also, generate an SEO-friendly title for this product, a meta description that is under 155 characters, two focus keywords based on the meta description, and a list of relevant product tags.\n\n"
-                f'Please return ONLY a JSON object with the following keys: "long_description", "seo_title", "meta_description", "focus_keywords", "tags". No additional text or formatting is needed.'
-            ).format(long_description=long_description, product_title=product_title)
+        # Modify long description prompt
+        long_desc_prompt = (
+            f"As a product analyst, your task is to update our product listings for our B2B marketplace that is tailored for bulk sales. "
+            f"For products that have CAS or a chemical formula, you can look for those attributes from the following list if available: "
+            f"Compound Name, Synonyms, IUPAC Name, CAS Number, Molecular Formula, Molecular Weight, Canonical SMILES, InChI strings, "
+            f"Boiling Point, Melting Point, Flash Point, Density, Solubility, Vapor Pressure, Refractive Index, pH, LogP, Polar Surface Area, "
+            f"Rotatable Bond Count, Hazard and Precautionary Statements, GHS Classification, LD50, Routes of Exposure, Carcinogenicity, "
+            f"Teratogenicity, Bioassay Results, Target Proteins, Mechanism of Action, Pharmacological Class, ADME data, NMR, MS, IR, UV-Vis, "
+            f"Environmental Fate, Biodegradability, Ecotoxicity, Therapeutic Uses, Dosage, Contraindications, Side Effects, Drug Interactions.\n\n"
+            f"For other products in the marketplace, use your general product knowledge data up to September 2021 to help enhance and expand the listing. "
+            f"Start by utilizing the initial description provided: '{long_description}'. After gathering the details, craft a compelling 1000-word "
+            f"detail product description in HTML highlighting the product's key features for '{product_title}'. Use bullet points for vital information "
+            f"and exclude any unrelated supplier specifics or non-pertinent product data.\n\n"
+            f"IMPORTANT: If specific data for an attribute isn't known, SKIP that attribute entirely. Do not use placeholders like 'Not available'.\n\n"
+            f"Also, generate an SEO-friendly title for this product, a meta description that is under 155 characters, two focus keywords based on the meta description, and a list of relevant product tags.\n\n"
+            f'Please return ONLY a JSON object with the following keys: "long_description", "seo_title", "meta_description", "focus_keywords", "tags". No additional text or formatting is needed.'
+        ).format(long_description=long_description, product_title=product_title)
         result_data_short = await generate_description(
             short_desc_prompt, product_title, "short description"
         )
