@@ -390,6 +390,7 @@ async def update_product_descriptions_locally(
             short_description = "No short description available."
         long_description = product.get("description")
         final_product_url = None
+        response_data = {}
 
         if await is_product_updated(product_id):
             response = input(
@@ -416,13 +417,24 @@ async def update_product_descriptions_locally(
         result_data_short = await generate_description(
             await short_desc_prompt, product_title, "short description"
         )
-
+        if result_data_short is None or not isinstance(result_data_short, dict):
+            logger.error(
+                f"Unexpected type for result_data_short: {type(result_data_short)}. Expected dict."
+            )
+            return
         if result_data_short is not None:
             short_description = result_data_short["short_description"]
 
         result_data_long = await generate_description(
             await long_desc_prompt, product_title, "long description"
         )
+        if result_data_long is None or not isinstance(result_data_long, dict):
+            logger.error(
+                f"Unexpected type for result_data_long: {type(result_data_long)}. Expected dict."
+            )
+            return
+
+        final_product_url = response_data.get("permalink")
 
         if result_data_long is not None:
             long_description = result_data_long["long_description"]
@@ -448,7 +460,6 @@ async def update_product_descriptions_locally(
             logger.error(
                 f"Unexpected type for response_data: {type(response_data)}. Expected dict."
             )
-            return
         final_product_url = response_data.get("permalink")
 
         # Calculate elapsed_time right after the update process is done
@@ -487,6 +498,8 @@ async def update_product_descriptions_locally(
             product.get("description"),
         )
 
+    return
+
 
 async def update_product_on_woocommerce(
     session,
@@ -509,12 +522,12 @@ async def update_product_on_woocommerce(
     new_long_description = unescape(new_long_description)
 
     # Convert the list of focus keywords to a comma-separated string
-    focus_keyword_string = ",".join(focus_keyword).replace(
-        ", ", ","
-    )  # This removes the space after commas
+    focus_keyword_string = ",".join(focus_keyword).replace(", ", ",")
 
-    # Rate limiting: Introducing a delay between successive requests to avoid overwhelming the server
+    # Rate limiting: Introducing a delay between successive requests
     await asyncio.sleep(2)
+
+    timeout = aiohttp.ClientTimeout(total=60)  # Setting a 60 seconds timeout
 
     for i in range(retries):
         try:
@@ -530,29 +543,23 @@ async def update_product_on_woocommerce(
                     {"key": "_yoast_wpseo_focuskw", "value": focus_keyword},
                 ],
             }
-            # Print or log the payload
-            # print(payload)  # This will output the payload to the console
 
             # Now, make the API call using this payload
             async with session.put(
                 f"{wcapi.url}/wp-json/wc/v3/products/{product_id}",
                 auth=aiohttp.BasicAuth(wcapi.consumer_key, wcapi.consumer_secret),
-                json=payload,  # Use the payload variable here
+                json=payload,
                 ssl=False,
+                timeout=timeout,
             ) as resp:
-                # Check if the response is HTML and handle it
-                if "text/html" in resp.headers.get("Content-Type", ""):
-                    logger.error(
-                        f"Received an HTML response from WooCommerce API on attempt {i+1}: {await resp.text()}"
-                    )
-                    # If it's a gateway timeout error, we retry
-                    if "Gateway time-out" in await resp.text():
-                        raise Exception("Gateway timeout error.")
-                    else:
-                        return
-
                 response_data = await resp.json()
-                # print("API Response:", response_data)  # Print the response to see what WooCommerce returns
+
+                # Check if response_data is a dictionary
+                if not isinstance(response_data, dict):
+                    logger.error(
+                        f"Unexpected data type: {type(response_data)}. Expected dict."
+                    )
+                    return
 
                 if resp.status == 200:
                     if response_data is None or not isinstance(response_data, dict):
@@ -569,6 +576,23 @@ async def update_product_on_woocommerce(
                 else:
                     raise Exception(f"Error {resp.status}: {response_data}")
 
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Request to update product {product_id} timed out on attempt {i+1}."
+            )
+            if i == retries - 1:
+                await save_failed_product(
+                    product_id,
+                    "product_name",
+                    "product_url",
+                    new_short_description,
+                    new_long_description,
+                )
+                return None, None
+            else:
+                # Exponential backoff
+                await asyncio.sleep(backoff_factor * (2**i))
+                continue
         except aiohttp.client_exceptions.ServerDisconnectedError:
             if i < retries - 1:
                 await asyncio.sleep(backoff_factor * (2**i))  # Exponential backoff
