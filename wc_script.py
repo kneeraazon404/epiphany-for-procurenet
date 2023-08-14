@@ -1,18 +1,13 @@
 # 1. Import the necessary libraries
 import asyncio
-import codecs
-import itertools
 import json
 import logging
 import os
 import sys
 import time
-import traceback
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 from html import unescape
-
 import aiohttp
 import openai
 import psycopg2
@@ -85,6 +80,16 @@ conn = psycopg2.connect(
 c = conn.cursor()
 
 
+def delete_tables():
+    c.execute("DELETE FROM updated_products")
+    c.execute("DELETE FROM failed_products")
+    c.execute("DELETE FROM generated_responses")
+    conn.commit()
+
+
+delete_tables()
+
+
 def create_tables():
     c.execute(
         """
@@ -122,38 +127,109 @@ def call_chat_completions(model, messages):
         model=model,
         messages=messages,
     )
+
+    # Handle potential rate limit errors
+    if not isinstance(response, dict):
+        logger.error(
+            "Unexpected response from OpenAI API. Waiting for 5 seconds before retrying..."
+        )
+        time.sleep(5)  # Wait for 5 seconds
+        response = openai.ChatCompletion.create(
+            model=model,
+            messages=messages,
+        )
+
+        time.sleep(5)  # Wait for 5 seconds before the next request
+        return None
+
+    # Check for rate limit errors in the API response
+    if "usage" in response and "total_tokens" in response["usage"]:
+        total_tokens = response["usage"]["total_tokens"]
+        if total_tokens > 9000:  # You may need to adjust this threshold
+            logger.warning("Approaching rate limit. Pausing for a moment.")
+            time.sleep(10)  # Wait for 10 seconds
+
     print(f"Raw API Response: {response}")
+
     return response
 
 
 def extract_json_string(generated_text):
-    # Find the start and end of the JSON object
-    start = generated_text.find("{")
-    end = generated_text.rfind("}")
+    # Find all occurrences of '{' and '}'
+    start_indices = [i for i, char in enumerate(generated_text) if char == "{"]
+    end_indices = [i for i, char in enumerate(generated_text) if char == "}"]
 
-    # Extract the JSON object
-    json_string = generated_text[start : end + 1]
+    # Ensure there's at least one pair of '{' and '}'
+    if start_indices and end_indices:
+        # Use the last '{' and the first '}' after it to extract the JSON string
+        start = start_indices[-1]
+        end = next(idx for idx in end_indices if idx > start)
+        json_string = generated_text[start : end + 1]
+    else:
+        logger.error(
+            "Failed to extract JSON string from the generated text due to delimiter issues."
+        )
+        return "{}"
 
     return json_string
 
 
 def sanitize_json_string(json_string):
+    # Initially sanitize the json_string
+    sanitized_string = remove_control_characters_and_unwanted_backslashes(json_string)
+
     try:
-        # Try to load the JSON string. If it's valid JSON and there are no control characters, this will succeed.
-        data = json.loads(json_string)
-    except json.JSONDecodeError:
-        # If there's an error, remove control characters and unwanted backslashes from the string and try again.
-        sanitized_string = remove_control_characters_and_unwanted_backslashes(
-            json_string
-        )
+        # Try to load the sanitized JSON string.
         data = json.loads(sanitized_string)
+    except json.JSONDecodeError as error:
+        # If there's still an error, log the problematic string and error
+        logger.error(
+            f"Failed to parse JSON after sanitization. Error: {error}. JSON String: {sanitized_string}"
+        )
+        return {}
 
     return data
 
 
 def remove_control_characters_and_unwanted_backslashes(s):
-    sanitized_string = "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
-    sanitized_string = sanitized_string.encode("utf-8").decode("unicode_escape")
+    """
+    Further sanitize the given string by:
+    1. Removing specific unwanted control characters, including newlines.
+    2. Handling double backslashes and other escape sequences.
+    """
+    # Removing specific unwanted control characters (e.g. BEL, FF, VT, newline).
+    unwanted_chars = ["\a", "\f", "\v", "\n"]
+    for char in unwanted_chars:
+        s = s.replace(char, "")
+
+    # Handling double backslashes and other escape sequences.
+    sanitized_string = ""
+    i = 0
+    while i < len(s):
+        if s[i] == "\\":
+            # If double backslashes are found, replace them with a single backslash
+            if i + 1 < len(s) and s[i + 1] == "\\":
+                sanitized_string += "\\"
+                i += 2
+            # If a valid escape sequence is found, preserve it
+            elif i + 1 < len(s) and s[i + 1] in [
+                "n",
+                "r",
+                "t",
+                "b",
+                "f",
+                '"',
+                "'",
+                "\\",
+            ]:
+                sanitized_string += s[i : i + 2]
+                i += 2
+            else:
+                sanitized_string += s[i]
+                i += 1
+        else:
+            sanitized_string += s[i]
+            i += 1
 
     return sanitized_string
 
@@ -179,39 +255,6 @@ async def request_with_retry(url, retries=3, backoff_factor=0.3):
                     await asyncio.sleep(backoff_factor * (2**retry))
                 else:
                     raise
-
-
-async def generate_description(prompt, product_title, description_type):
-    assistant_messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": prompt},
-    ]
-    response = None
-    logger.info(f"Generating new {description_type} for the product '{product_title}'.")
-    loop = asyncio.get_event_loop()
-
-    async with semaphore:
-        try:
-            with ThreadPoolExecutor() as executor:
-                response = await loop.run_in_executor(
-                    executor,
-                    call_chat_completions,
-                    "gpt-4",
-                    assistant_messages,
-                )
-            if response and response.get("choices") and len(response["choices"]) > 0:
-                generated_text = response["choices"][0]["message"]["content"]
-
-                # Extract the JSON object string from the generated text
-                json_string = extract_json_string(generated_text)
-
-                # Sanitize the JSON string and parse it as a JSON object
-                data = sanitize_json_string(json_string)
-
-                return data
-        except Exception as error:
-            logger.error(f"Error during OpenAI API call: {error}")
-            return None
 
 
 async def get_category_data(session, wcapi, category_id):
@@ -254,10 +297,83 @@ async def retry_failed_products():
     await asyncio.gather(*tasks)
 
 
+async def generate_description(prompt, product_title, description_type):
+    prompt = remove_control_characters_and_unwanted_backslashes(prompt)
+    assistant_messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": prompt},
+    ]
+    response = None
+    logger.info(f"Generating new {description_type} for the product '{product_title}'.")
+    loop = asyncio.get_event_loop()
+
+    async with semaphore:
+        try:
+            with ThreadPoolExecutor() as executor:
+                response = await loop.run_in_executor(
+                    executor,
+                    call_chat_completions,
+                    "gpt-4",
+                    assistant_messages,
+                )
+
+            if response is None or not isinstance(response, dict):
+                logger.error("Received None response from OpenAI API. Retrying...")
+                return None
+
+            if response.get("choices") and len(response["choices"]) > 0:
+                generated_text = response["choices"][0]["message"]["content"]
+
+                # Extract the JSON object string from the generated text
+                json_string = extract_json_string(generated_text)
+
+                # Sanitize the JSON string and parse it as a JSON object
+                data = sanitize_json_string(json_string)
+
+                return data
+        except Exception as error:
+            logger.error(f"Error during OpenAI API call: {error}")
+            return None
+
+
 async def is_product_updated(product_id):
     query = "SELECT EXISTS(SELECT 1 FROM updated_products WHERE id = %s)"
     c.execute(query, (product_id,))
     return c.fetchone()[0]
+
+
+async def generate_short_description(product_title, short_description):
+    short_desc_prompt = (
+        f"As a product analyst, your task is to update our product listings for a B2B marketplace. "
+        f"Start with the base description: '{short_description}'. If the product has a chemical formula or CAS number, integrate "
+        f"pertinent details from your data up to September 2021. For other products in the marketplace, use your general product knowledge "
+        f"to enhance and expand the listing. Filter out irrelevant supplier data and unnecessary product specifics. "
+        f"Craft a compelling 150-word short description in HTML for product '{product_title}'. Employ bullet points when presenting crucial details, "
+        f"apply bold formatting to emphasize keywords in each bullet point, and omit any nonessential supplier specifics or irrelevant product data. "
+        f"IMPORTANT: If specific data for an attribute like CAS number or chemical formula isn't known, SKIP that attribute entirely. Do not use placeholders like 'Not available' or 'still being determined'. "
+        f'Please return ONLY a JSON object with the following key: "short_description". No additional text or formatting is needed.'
+    )
+    return json.dumps({"short_description": short_desc_prompt})
+
+
+async def generate_long_description(product_title, long_description):
+    long_desc_prompt = (
+        f"As a product analyst, your task is to update our product listings for a B2B marketplace. "
+        f"For products that have CAS or a chemical formula, you can look for those attributes from the following list if available: "
+        f"Compound Name, Synonyms, IUPAC Name, CAS Number, Molecular Formula, Molecular Weight, Canonical SMILES, InChI strings, "
+        f"Boiling Point, Melting Point, Flash Point, Density, Solubility, Vapor Pressure, Refractive Index, pH, LogP, Polar Surface Area, "
+        f"Rotatable Bond Count, Hazard and Precautionary Statements, GHS Classification, LD50, Routes of Exposure, Carcinogenicity, "
+        f"Teratogenicity, Bioassay Results, Target Proteins, Mechanism of Action, Pharmacological Class, ADME data, NMR, MS, IR, UV-Vis, "
+        f"Environmental Fate, Biodegradability, Ecotoxicity, Therapeutic Uses, Dosage, Contraindications, Side Effects, Drug Interactions.\n\n"
+        f"For other products in the marketplace, use your general product knowledge data up to September 2021 to help enhance and expand the listing. "
+        f"Start by utilizing the initial description provided: '{long_description}'. After gathering the details, craft a compelling 1000-word "
+        f"detail product description in HTML highlighting the product's key features for '{product_title}'. Use bullet points for vital information "
+        f"and exclude any unrelated supplier specifics or non-pertinent product data.\n\n"
+        f"IMPORTANT: If specific data for an attribute isn't known, SKIP that attribute entirely. Do not use placeholders like 'Not available'.\n\n"
+        f"Also, generate an SEO-friendly title for this product, a meta description that is under 155 characters, a focus keyword based on the meta description, and a list of relevant product tags.\n\n"
+        f'Please return ONLY a JSON object with the following keys: "long_description", "seo_title", "meta_description", "focus_keyword", "tags". No additional text or formatting is needed.'
+    )
+    return json.dumps({"long_description": long_desc_prompt})
 
 
 async def update_product_descriptions_locally(
@@ -282,62 +398,38 @@ async def update_product_descriptions_locally(
             if response.lower() != "yes":
                 logger.info(f"Skipping product '{product_id}' - {product_title}.")
                 return
-            # Generate prompts for short and long description
-        short_desc_prompt = (
-            f"As a product analyst, your task is to update our product listings for a B2B marketplace that is tailored for bulk sales. "
-            f"Start with the base description: '{short_description}'. If the product has a chemical formula or CAS number, integrate "
-            f"pertinent details from your data up to September 2021. For other products in the marketplace, use your general product knowledge "
-            f"to enhance and expand the listing. Filter out irrelevant supplier data and unnecessary product specifics. "
-            f"Craft a compelling 150-word short description in HTML for product '{product_title}'. Employ bullet points when presenting crucial details, "
-            f"apply bold formatting to emphasize keywords in each bullet point, and omit any nonessential supplier specifics or irrelevant product data. "
-            f"IMPORTANT: If specific data for an attribute like CAS number or chemical formula isn't known, SKIP that attribute entirely. Do not use placeholders like 'Not available' or 'still being determined'. "
-            f'Please return ONLY a JSON object with the following key: "short_description". No additional text or formatting is needed.'
-        ).format(short_description=short_description, product_title=product_title)
 
-        # Modify long description prompt
-        long_desc_prompt = (
-            f"As a product analyst, your task is to update our product listings for our B2B marketplace that is tailored for bulk sales. "
-            f"For products that have CAS or a chemical formula, you can look for those attributes from the following list if available: "
-            f"Compound Name, Synonyms, IUPAC Name, CAS Number, Molecular Formula, Molecular Weight, Canonical SMILES, InChI strings, "
-            f"Boiling Point, Melting Point, Flash Point, Density, Solubility, Vapor Pressure, Refractive Index, pH, LogP, Polar Surface Area, "
-            f"Rotatable Bond Count, Hazard and Precautionary Statements, GHS Classification, LD50, Routes of Exposure, Carcinogenicity, "
-            f"Teratogenicity, Bioassay Results, Target Proteins, Mechanism of Action, Pharmacological Class, ADME data, NMR, MS, IR, UV-Vis, "
-            f"Environmental Fate, Biodegradability, Ecotoxicity, Therapeutic Uses, Dosage, Contraindications, Side Effects, Drug Interactions.\n\n"
-            f"For other products in the marketplace, use your general product knowledge data up to September 2021 to help enhance and expand the listing. "
-            f"Start by utilizing the initial description provided: '{long_description}'. After gathering the details, craft a compelling 1000-word "
-            f"detail product description in HTML highlighting the product's key features for '{product_title}'. Use bullet points for vital information "
-            f"and exclude any unrelated supplier specifics or non-pertinent product data.\n\n"
-            f"IMPORTANT: If specific data for an attribute isn't known, SKIP that attribute entirely. Do not use placeholders like 'Not available'.\n\n"
-            f"Also, generate an SEO-friendly title for this product, a meta description that is under 155 characters, two focus keywords based on the meta description, and a list of relevant product tags.\n\n"
-            f'Please return ONLY a JSON object with the following keys: "long_description", "seo_title", "meta_description", "focus_keywords", "tags". No additional text or formatting is needed.'
-        ).format(long_description=long_description, product_title=product_title)
+        # Use a ThreadPoolExecutor to run generate_short_description and generate_long_description concurrently
+        with ThreadPoolExecutor() as executor:
+            short_desc_prompt_future = executor.submit(
+                generate_short_description, product_title, short_description
+            )
+            long_desc_prompt_future = executor.submit(
+                generate_long_description, product_title, long_description
+            )
+
+        # Call result() on each future to ensure the function has completed and to get the result
+        short_desc_prompt = short_desc_prompt_future.result()
+        long_desc_prompt = long_desc_prompt_future.result()
+
+        # Call the generate_description function
         result_data_short = await generate_description(
-            short_desc_prompt, product_title, "short description"
+            await short_desc_prompt, product_title, "short description"
         )
 
         if result_data_short is not None:
             short_description = result_data_short["short_description"]
-        else:
-            logger.error(
-                f"No short description generated for product '{product_title}'. Skipping update."
-            )
-            return
 
         result_data_long = await generate_description(
-            long_desc_prompt, product_title, "long description"
+            await long_desc_prompt, product_title, "long description"
         )
 
         if result_data_long is not None:
             long_description = result_data_long["long_description"]
             seo_title_long = result_data_long["seo_title"]
             seo_meta_description_long = result_data_long["meta_description"]
-            focus_keywords_long = result_data_long["focus_keywords"]
+            focus_keyword_long = result_data_long["focus_keyword"]
             tags_long = result_data_long["tags"]
-        else:
-            logger.error(
-                f"No long description generated for product '{product_title}'. Skipping update."
-            )
-            return
 
         # Call the update_product_on_woocommerce with the appropriate arguments:
         response_data = await update_product_on_woocommerce(
@@ -349,10 +441,10 @@ async def update_product_descriptions_locally(
             seo_title_long,
             seo_meta_description_long,
             tags_long,
-            focus_keywords_long,  # Pass the focus keywords
+            focus_keyword_long,  # Pass the focus keywords
         )
 
-        if not isinstance(response_data, dict):
+        if response_data is None or not isinstance(response_data, dict):
             logger.error(
                 f"Unexpected type for response_data: {type(response_data)}. Expected dict."
             )
@@ -396,24 +488,111 @@ async def update_product_descriptions_locally(
         )
 
 
-async def generate_seo_content(description):
-    # Generate SEO title from the first sentence
-    seo_title = description.split(".")[0]
-    print(f"\nGenerated SEO Title:\n{seo_title}")
+async def update_product_on_woocommerce(
+    session,
+    wcapi,
+    product_id,
+    new_short_description,
+    new_long_description,
+    seo_title,
+    seo_meta_description,
+    tags,
+    focus_keyword,
+):
+    # Prepare the tags in the format WooCommerce expects
+    formatted_tags = [{"name": tag} for tag in tags]
+    retries = 5  # Increased number of retries
+    response_data = None
+    backoff_factor = 0.3
 
-    # Generate SEO meta description from the first two sentences
-    seo_meta_description = " ".join(description.split(".")[:2])
-    print(f"\nGenerated SEO Meta Description:\n{seo_meta_description}")
+    new_short_description = unescape(new_short_description)
+    new_long_description = unescape(new_long_description)
 
-    # Generate tags by splitting the description into words and picking the first few unique words
-    tags = list(set(description.split()))[:10]
-    print(f"\nGenerated Product Tags:\n{tags}")
+    # Convert the list of focus keywords to a comma-separated string
+    focus_keyword_string = ",".join(focus_keyword).replace(
+        ", ", ","
+    )  # This removes the space after commas
 
-    # Generate focus keywords by picking the first two unique words
-    focus_keywords = " ".join(tags[:2])
-    print(f"\nGenerated Focus Keywords:\n{focus_keywords}")
+    # Rate limiting: Introducing a delay between successive requests to avoid overwhelming the server
+    await asyncio.sleep(2)
 
-    return seo_title, seo_meta_description, tags, focus_keywords
+    for i in range(retries):
+        try:
+            # Construct the payload
+            payload = {
+                "name": seo_title,
+                "short_description": new_short_description,
+                "description": new_long_description,
+                "tags": formatted_tags,
+                "meta_data": [
+                    {"key": "_yoast_wpseo_metadesc", "value": seo_meta_description},
+                    {"key": "_yoast_wpseo_title", "value": seo_title},
+                    {"key": "_yoast_wpseo_focuskw", "value": focus_keyword},
+                ],
+            }
+            # Print or log the payload
+            # print(payload)  # This will output the payload to the console
+
+            # Now, make the API call using this payload
+            async with session.put(
+                f"{wcapi.url}/wp-json/wc/v3/products/{product_id}",
+                auth=aiohttp.BasicAuth(wcapi.consumer_key, wcapi.consumer_secret),
+                json=payload,  # Use the payload variable here
+                ssl=False,
+            ) as resp:
+                # Check if the response is HTML and handle it
+                if "text/html" in resp.headers.get("Content-Type", ""):
+                    logger.error(
+                        f"Received an HTML response from WooCommerce API on attempt {i+1}: {await resp.text()}"
+                    )
+                    # If it's a gateway timeout error, we retry
+                    if "Gateway time-out" in await resp.text():
+                        raise Exception("Gateway timeout error.")
+                    else:
+                        return
+
+                response_data = await resp.json()
+                # print("API Response:", response_data)  # Print the response to see what WooCommerce returns
+
+                if resp.status == 200:
+                    if response_data is None or not isinstance(response_data, dict):
+                        logger.error(
+                            f"Unexpected type for response_data: {type(response_data)}. Expected dict."
+                        )
+                        return
+                    final_product_url = response_data.get("permalink")
+                    await remove_failed_product(product_id)
+                    await save_updated_product(
+                        product_id, response_data["name"], final_product_url
+                    )
+                    break  # If successful, break out of the retry loop
+                else:
+                    raise Exception(f"Error {resp.status}: {response_data}")
+
+        except aiohttp.client_exceptions.ServerDisconnectedError:
+            if i < retries - 1:
+                await asyncio.sleep(backoff_factor * (2**i))  # Exponential backoff
+                continue
+            else:
+                logger.error(f"Server disconnected after {i + 1} attempts.")
+                raise
+        except Exception as e:
+            logger.error(f"Error while updating the product on attempt {i+1}: {e}.")
+            if i == retries - 1:
+                await save_failed_product(
+                    product_id,
+                    "product_name",
+                    "product_url",
+                    new_short_description,
+                    new_long_description,
+                )
+                return None, None
+            else:
+                # Exponential backoff
+                await asyncio.sleep(backoff_factor * (2**i))
+                continue
+
+    return response_data
 
 
 async def get_product_data(session, wcapi, product_id):
@@ -443,97 +622,6 @@ async def get_product_data(session, wcapi, product_id):
         print(f"Error while getting product data: {e}")
 
     return None
-
-
-async def update_product_on_woocommerce(
-    session,
-    wcapi,
-    product_id,
-    new_short_description,
-    new_long_description,
-    seo_title,
-    seo_meta_description,
-    tags,
-    focus_keywords,
-):
-    # Prepare the tags in the format WooCommerce expects
-    formatted_tags = [{"name": tag} for tag in tags]
-    retries = 3
-    response_data = None
-    backoff_factor = 0.3
-
-    new_short_description = unescape(new_short_description)
-    new_long_description = unescape(new_long_description)
-
-    for i in range(retries):
-        try:
-            # Update product data
-            async with session.put(
-                f"{wcapi.url}/wp-json/wc/v3/products/{product_id}",
-                auth=aiohttp.BasicAuth(wcapi.consumer_key, wcapi.consumer_secret),
-                json={
-                    "name": seo_title,
-                    "short_description": new_short_description,
-                    "description": new_long_description,
-                    "tags": formatted_tags,
-                    "meta_data": [
-                        {"key": "_yoast_wpseo_metadesc", "value": seo_meta_description},
-                        {"key": "_yoast_wpseo_title", "value": seo_title},
-                        {"key": "_yoast_wpseo_focuskw", "value": focus_keywords},
-                    ],
-                },
-                ssl=False,
-            ) as resp:
-                # Check if the response is HTML and handle it
-                if "text/html" in resp.headers.get("Content-Type", ""):
-                    logger.error(
-                        f"Received an HTML response from WooCommerce API: {await resp.text()}"
-                    )
-                    return
-
-                try:
-                    response_data = await resp.json()
-                except Exception as e:
-                    logger.error(
-                        f"Error decoding WooCommerce API response as JSON: {e}"
-                    )
-                    return
-
-                if resp.status == 200:
-                    if not isinstance(response_data, dict):
-                        logger.error(
-                            f"Unexpected type for response_data: {type(response_data)}. Expected dict."
-                        )
-                        return
-                    final_product_url = response_data.get("permalink")
-                    await remove_failed_product(product_id)
-                    await save_updated_product(
-                        product_id, response_data["name"], final_product_url
-                    )
-                else:
-                    raise Exception(f"Error {resp.status}: {response_data}")
-
-        except aiohttp.client_exceptions.ServerDisconnectedError:
-            if i < retries - 1:
-                await asyncio.sleep(
-                    backoff_factor * (2**i)
-                )  # Backoff before retrying
-                continue
-            else:
-                logger.error(f"Server disconnected after {i + 1} attempts.")
-                raise
-        except Exception as e:
-            logger.error(f"Error while updating the product: {e}.")
-            await save_failed_product(
-                product_id,
-                "product_name",
-                "product_url",
-                new_short_description,
-                new_long_description,
-            )
-            return None, None
-
-    return response_data
 
 
 async def update_yoast_meta(session, wcapi, product_id, meta_key, meta_value):
@@ -688,7 +776,7 @@ async def update_category_products():
 
     products = []
     page = 1
-    per_page = 25
+    per_page = 100
 
     while len(products) < product_count:
         page_products = await get_products_in_category(
@@ -727,36 +815,63 @@ async def update_category_products():
     await asyncio.gather(*tasks)
 
 
+async def get_all_products(session, wcapi, page, per_page=25):
+    products = []
+
+    async with semaphore, session.get(
+        f"{wcapi.url}/wp-json/wc/v3/products",
+        params={"page": page, "per_page": per_page},
+        auth=aiohttp.BasicAuth(wcapi.consumer_key, wcapi.consumer_secret),
+        ssl=False,
+    ) as resp:
+        products_data = await resp.json()
+        products.extend(products_data)
+
+    return products
+
+
 async def update_entire_catalog():
     print("Updating entire catalog...")
+
     products = []
     page = 1
-    per_page = 25
+    per_page = 100
 
-    while True:
-        async with session.get(
-            f"{wcapi.url}/wp-json/wc/v3/products",
-            params={"page": page, "per_page": per_page},
-            auth=aiohttp.BasicAuth(wcapi.consumer_key, wcapi.consumer_secret),
-            ssl=False,
-        ) as resp:
-            page_products = await resp.json()
-            products.extend(page_products)
+    # First, get the total number of products
+    total_products = await get_all_products(session, wcapi, 1, 1)
+    total_products = len(total_products)
 
-            if len(page_products) < per_page:
-                break
+    while len(products) < total_products:
+        page_products = await get_all_products(session, wcapi, page, per_page)
+        products.extend(page_products)
+        page += 1
 
-            page += 1
-
-    total_products = len(products)
     elapsed_time = time.time() - start_time
 
-    tasks = [
-        update_product_descriptions_locally(
-            session, wcapi, product, index + 1, total_products, start_time, elapsed_time
-        )
-        for index, product in enumerate(products)
-    ]
+    async def handle_update(product, index):
+        try:
+            await update_product_descriptions_locally(
+                session,
+                wcapi,
+                product,
+                index + 1,
+                total_products,
+                start_time,
+                elapsed_time,
+            )
+        except Exception as e:
+            logger.error(
+                f"Error updating product {product['id']} - {product.get('name')}: {str(e)}"
+            )
+            await save_failed_product(
+                product["id"],
+                product.get("name"),
+                product.get("permalink"),
+                product.get("short_description"),
+                product.get("description"),
+            )
+
+    tasks = [handle_update(product, index) for index, product in enumerate(products)]
     await asyncio.gather(*tasks)
 
 
