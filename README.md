@@ -1,4 +1,4 @@
-# ePiphany-for-Procurenet  
+# ePiphany for Procurenet  
 
 ## Overview  
 
