@@ -1,4 +1,3 @@
-```markdown
 # ePiphany-for-Procurenet  
 
 ## Overview  
@@ -79,9 +78,8 @@ Ensure you have the following installed:
 1. Clone the repository:  
    ```bash  
    git clone https://github.com/kneeraazon404/ePiphany-for-Procurenet.git  
-   cd ePiphany-for-Procurenet  
-   ```  
-
+   cd ePiphany-for-Procurenet
+   
 2. Set up a virtual environment:  
    ```bash  
    python -m venv venv  
